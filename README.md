@@ -376,6 +376,414 @@ Ce flux ressemble fortement à une initialisation de session ou d’authentifica
 
 ## Capture batterie
 
+## Processus Xiaomi Home observés
+
+Pendant les tests, Xiaomi Home lance plusieurs processus Android distincts.
+
+Exemple observé :
+
+```txt
+com.xiaomi.smarthome
+com.xiaomi.smarthome:plugin0
+com.xiaomi.smarthome:pushservice
+com.xiaomi.smarthome:plugin1
+```
+
+Exemple de PIDs observés lors d’une capture :
+
+```txt
+MAIN=2618
+PLUGIN0=3288
+PLUGIN1=3984
+```
+
+Puis, après relance de l’application, les PIDs ont changé :
+
+```txt
+3012 = com.xiaomi.smarthome
+3518 = com.xiaomi.smarthome:plugin0
+```
+
+Les PIDs sont donc volatiles et doivent être récupérés à chaque nouvelle session avec :
+
+```bash
+adb shell ps -A | grep -iE "xiaomi|smarthome|plugin|arthome"
+```
+
+ou :
+
+```bash
+adb shell pidof -s com.xiaomi.smarthome
+adb shell pidof -s com.xiaomi.smarthome:plugin0
+adb shell pidof -s com.xiaomi.smarthome:plugin1
+```
+
+---
+
+## Observations logcat côté Xiaomi Home
+
+Des captures `logcat` ont été réalisées pour voir si Xiaomi Home affichait directement les données batterie déjà déchiffrées.
+
+Deux approches ont été testées :
+
+1. filtrage large par mots-clés ;
+2. capture globale puis filtrage par PID Xiaomi.
+
+### Résultat du filtrage large
+
+Le premier filtrage avec des mots-clés comme :
+
+```txt
+battery
+batt
+bms
+voltage
+volt
+current
+soc
+cell
+charge
+capacity
+temperature
+power
+miio
+miot
+scooter
+```
+
+a surtout retourné beaucoup de bruit Android :
+
+```txt
+TrafficStats
+Conscrypt
+Firebase
+Gms
+InetDiag
+BatteryService
+GC freed
+```
+
+Le mot `soc`, par exemple, peut aussi matcher dans `Socket`, ce qui crée des faux positifs.
+
+La seule information vraiment intéressante dans ce premier log était la présence du plugin :
+
+```txt
+INFO: OLD PLUGIN INFO OF xiaomi.scooter.5pro
+```
+
+Conclusion : le filtrage large ne donne pas les données batterie en clair.
+
+---
+
+## Observations logcat filtrées par PID
+
+Une capture plus propre a été faite avec `adb logcat -v threadtime`, puis filtrée par PID.
+
+Commande utilisée :
+
+```bash
+PID_MAIN=$(adb shell pidof -s com.xiaomi.smarthome | tr -d '\r')
+PID_PLUGIN0=$(adb shell pidof -s com.xiaomi.smarthome:plugin0 | tr -d '\r')
+PID_PLUGIN1=$(adb shell pidof -s com.xiaomi.smarthome:plugin1 | tr -d '\r')
+
+echo "MAIN=$PID_MAIN PLUGIN0=$PID_PLUGIN0 PLUGIN1=$PID_PLUGIN1"
+
+adb logcat -c
+adb logcat -v threadtime > ~/xiaomi_all_threadtime.txt
+```
+
+Après la capture :
+
+```bash
+awk -v p1="$PID_MAIN" -v p2="$PID_PLUGIN0" -v p3="$PID_PLUGIN1" \
+'$3==p1 || $3==p2 || $3==p3' \
+~/xiaomi_all_threadtime.txt > ~/xiaomi_pid_only.txt
+```
+
+Nettoyage :
+
+```bash
+grep -viE "TrafficStats|InetDiag|GC freed|ImeTracker|WindowManager|GraphicsEnvironment|InputMethod|artd|Bugle|Rcs|Firebase|Gms" \
+~/xiaomi_pid_only.txt > ~/xiaomi_pid_only_clean.txt
+```
+
+Cette capture a confirmé plusieurs éléments importants côté Xiaomi Home.
+
+---
+
+## Cycle GATT confirmé côté Xiaomi Home
+
+Le logcat filtré par PID montre que Xiaomi Home se connecte bien à la trottinette via GATT.
+
+Exemples observés :
+
+```txt
+BluetoothGatt: connect() - device: XX:XX:XX:XX:1D:E9, auto: false
+BluetoothGatt: registerApp()
+BluetoothGatt: onClientRegistered() - status=0 clientIf=6
+BluetoothGatt: onClientConnectionState() - status=0 clientIf=6 connected=true device=E8:4A:54:53:1D:E9
+BluetoothGatt: discoverServices() - device: XX:XX:XX:XX:1D:E9
+BluetoothGatt: onSearchComplete() = Device=E8:4A:54:53:1D:E9 Status=0
+```
+
+Cela confirme que Xiaomi Home utilise bien l’API Android `BluetoothGatt` classique.
+
+---
+
+## Notifications BLE activées par Xiaomi Home
+
+Après découverte des services, Xiaomi Home active les notifications sur plusieurs caractéristiques :
+
+```txt
+setCharacteristicNotification() - uuid: 0000001b-0000-1000-8000-00805f9b34fb enable: true
+setCharacteristicNotification() - uuid: 0000001a-0000-1000-8000-00805f9b34fb enable: true
+setCharacteristicNotification() - uuid: 0000001c-0000-1000-8000-00805f9b34fb enable: true
+setCharacteristicNotification() - uuid: 00000016-0000-1000-8000-00805f9b34fb enable: true
+setCharacteristicNotification() - uuid: 00000010-0000-1000-8000-00805f9b34fb enable: true
+```
+
+Cela confirme le rôle important des UUID suivants :
+
+| UUID       | Rôle confirmé / supposé              |
+| ---------- | ------------------------------------ |
+| `0000001a` | commandes principales app vers trott |
+| `0000001b` | réponses principales trott vers app  |
+| `0000001c` | infos simples en clair               |
+| `00000016` | handshake / authentification         |
+| `00000010` | canal Xiaomi secondaire              |
+
+---
+
+## MTU BLE confirmé
+
+Xiaomi Home demande un MTU de 247 :
+
+```txt
+BluetoothGatt: configureMTU() - device: XX:XX:XX:XX:1D:E9 mtu: 247
+BluetoothGatt: onConfigureMTU() - Device=E8:4A:54:53:1D:E9 mtu=247 status=0
+```
+
+Cela confirme que l’application prépare des échanges BLE avec des paquets plus grands que le MTU BLE par défaut.
+
+Cette observation colle avec les captures Bumble, où certains paquets `0x0021` et `0x0024` sont longs.
+
+---
+
+## Problèmes / warnings observés dans l’émulateur
+
+Plusieurs erreurs apparaissent dans logcat, mais elles ne semblent pas bloquer le fonctionnement principal.
+
+### Environnement non-MIUI
+
+Xiaomi Home essaie d’accéder à des classes MIUI absentes dans l’émulateur Android standard :
+
+```txt
+java.lang.NoClassDefFoundError: Failed resolution of: Lmiui/os/SystemProperties;
+Caused by: java.lang.ClassNotFoundException: miui.os.SystemProperties
+```
+
+Autre exemple :
+
+```txt
+ClassNotFoundException: miui.os.Build
+```
+
+Interprétation : Xiaomi Home vérifie probablement si l’app tourne sur MIUI / HyperOS. Comme l’émulateur est un Android standard, ces classes n’existent pas. L’erreur est visible, mais l’app continue de fonctionner.
+
+### Services Xiaomi absents
+
+On observe aussi :
+
+```txt
+Failed to find provider info for com.milink.service.device
+Failed to find provider info for com.xiaomi.iot.spec
+```
+
+Interprétation : certains services Xiaomi/MiLink ne sont pas présents dans l’émulateur. Cela peut casser certaines fonctions annexes, mais pas forcément la connexion BLE à la trott.
+
+### Classes générées introuvables
+
+On observe :
+
+```txt
+MiJiaRouter: not found class com.xiaomi.smarthome.generated.ServiceInit_...
+ClassNotFoundException
+```
+
+Interprétation : Xiaomi Home essaie de charger dynamiquement des modules/services. Certaines classes ne sont pas trouvées, mais le plugin de la trottinette continue malgré tout à fonctionner.
+
+---
+
+## Ce que les logs n’ont PAS donné
+
+Malgré les captures logcat :
+
+* aucune ligne claire avec `voltage` ;
+* aucune ligne claire avec `battery voltage` ;
+* aucun JSON évident contenant les infos BMS ;
+* aucune donnée batterie directement lisible ;
+* aucune structure claire du type `cell_voltage`, `current`, `capacity`, `temperature`.
+
+Conclusion : Xiaomi Home ne log pas les données batterie en clair dans logcat, ou alors elles passent dans une couche non visible avec les filtres actuels.
+
+---
+
+## Mise à jour de l’état actuel de la recherche
+
+Ce qui est maintenant confirmé :
+
+1. Le BLE fonctionne depuis Linux via Bumble.
+2. L’émulateur Android peut utiliser le contrôleur Bluetooth physique du PC.
+3. Xiaomi Home fonctionne dans l’émulateur avec Android 13 API 33.
+4. Xiaomi Home utilise bien `BluetoothGatt`.
+5. Xiaomi Home se connecte bien à `E8:4A:54:53:1D:E9`.
+6. Xiaomi Home découvre les services GATT sans erreur.
+7. Xiaomi Home active les notifications sur `0000001a`, `0000001b`, `0000001c`, `00000016` et `00000010`.
+8. Xiaomi Home configure un MTU de 247.
+9. Le protocole principal passe bien par `0x0021` et `0x0024`.
+10. Les petites commandes sur `0000001c` fonctionnent hors Xiaomi Home.
+11. Les réponses batterie ne sont pas visibles en clair dans le BLE brut.
+12. Les réponses batterie ne sont pas visibles en clair dans logcat classique.
+13. Le voltage batterie est donc probablement déchiffré ou interprété plus haut dans le code de Xiaomi Home/plugin.
+
+---
+
+## Mise à jour de la limite actuelle
+
+Le blocage principal n’est plus la connexion BLE.
+
+Le blocage actuel est la récupération du contenu décodé.
+
+On sait maintenant que :
+
+```txt
+BLE brut -> paquets sessionnés/chiffrés
+logcat classique -> pas de plaintext batterie
+```
+
+Le voltage existe forcément quelque part, car Xiaomi Home l’affiche ou l’utilise dans l’onglet batterie, mais il n’est pas exposé directement dans les logs.
+
+Il faut donc trouver l’endroit où Xiaomi Home :
+
+1. reçoit les notifications BLE ;
+2. déchiffre ou dépaquette la réponse ;
+3. transforme les données en objet interne / JSON ;
+4. transmet ces données au plugin ou à l’interface React Native ;
+5. affiche les valeurs batterie.
+
+---
+
+## Prochaine étape recommandée
+
+### Étape 1 : conserver les captures actuelles
+
+Les fichiers importants à garder sont :
+
+```txt
+~/xiaomi_ble_battery_capture.txt
+~/xiaomi_ble_battery_clean.txt
+~/battery_interesting_writes.txt
+~/battery_pairs.txt
+~/xiaomi_logcat_battery_clean.txt
+~/xiaomi_logcat_real.txt
+~/xiaomi_pid_only_clean.txt
+```
+
+Ces fichiers documentent :
+
+* le BLE brut ;
+* les requêtes candidates batterie ;
+* les réponses associées ;
+* le comportement GATT de Xiaomi Home ;
+* les limites de logcat.
+
+### Étape 2 : refaire une capture synchronisée BLE + logcat
+
+Pour mieux corréler les actions :
+
+1. lancer Bumble avec `tee` ;
+2. lancer `adb logcat -v threadtime` ;
+3. noter précisément l’heure de chaque clic ;
+4. ouvrir uniquement l’onglet batterie ;
+5. arrêter les deux captures.
+
+Objectif : relier précisément :
+
+```txt
+clic onglet batterie
+↓
+requête 0x0021
+↓
+réponse 0x0024
+↓
+éventuels logs Xiaomi
+```
+
+### Étape 3 : passer à l’analyse applicative
+
+Comme logcat ne donne pas les données en clair, il faudra probablement analyser Xiaomi Home côté app.
+
+Pistes :
+
+* chercher dans l’APK les chaînes :
+
+  * `battery`
+  * `bms`
+  * `voltage`
+  * `cell`
+  * `capacity`
+  * `current`
+  * `temperature`
+  * `scooter`
+  * `0000001a`
+  * `0000001b`
+  * `00000016`
+  * `0000001c`
+* chercher les classes autour de :
+
+  * `BluetoothGattCallback`
+  * `onCharacteristicChanged`
+  * `BluetoothGattCharacteristic.getValue`
+  * `PluginRNActivity`
+  * `IPluginRequest`
+  * `processResponse`
+  * `miot`
+  * `miio`
+
+### Étape 4 : hooking local avec Frida
+
+La prochaine piste sérieuse est d’utiliser Frida pour hooker les fonctions Android/Java côté Xiaomi Home.
+
+Fonctions candidates :
+
+```txt
+android.bluetooth.BluetoothGattCallback.onCharacteristicChanged
+android.bluetooth.BluetoothGattCharacteristic.getValue
+android.bluetooth.BluetoothGatt.writeCharacteristic
+org.json.JSONObject
+org.json.JSONArray
+com.xiaomi.router.miio.miioplugin.IPluginRequest$Stub.onTransact
+```
+
+Objectif : récupérer les données après réception BLE et, si possible, après déchiffrement.
+
+L’idée n’est pas de modifier le comportement de l’app, seulement d’observer ce qui transite en mémoire.
+
+### Étape 5 : ne pas rejouer les gros paquets pour l’instant
+
+Même si les requêtes `01000400` à `01001000` ont été identifiées, il ne faut pas encore les rejouer directement en Python.
+
+Raison :
+
+* elles semblent dépendre d’une session ;
+* elles utilisent des compteurs ;
+* elles sont probablement chiffrées ;
+* elles dépendent peut-être de clés générées pendant le handshake ;
+* elles peuvent être invalides hors contexte.
+
+Pour l’instant, seules les commandes simples sur `0000001c` sont considérées comme sûres.
+
+
 Une capture a été faite à partir du timecode :
 
 ```txt
